@@ -207,19 +207,18 @@
                      LENGTH(LENGTH OF ERROR-MSG)
            END-EXEC.
       * Write 90 bytes or as much as we have of commarea to TDQ
+      * D2-CUSTSECR-PASS (bytes 19-50) is blanked so the customer
+      * credential is never written to CSMT or GENAERRS
            IF EIBCALEN > 0 THEN
              IF EIBCALEN < 91 THEN
                MOVE DFHCOMMAREA(1:EIBCALEN) TO CA-DATA
-               EXEC CICS LINK PROGRAM('LGSTSQ')
-                         COMMAREA(CA-ERROR-MSG)
-                         LENGTH(LENGTH OF CA-ERROR-MSG)
-               END-EXEC
              ELSE
                MOVE DFHCOMMAREA(1:90) TO CA-DATA
-               EXEC CICS LINK PROGRAM('LGSTSQ')
-                         COMMAREA(CA-ERROR-MSG)
-                         LENGTH(LENGTH OF CA-ERROR-MSG)
-               END-EXEC
              END-IF
+             MOVE SPACES TO CA-DATA(19:32)
+             EXEC CICS LINK PROGRAM('LGSTSQ')
+                       COMMAREA(CA-ERROR-MSG)
+                       LENGTH(LENGTH OF CA-ERROR-MSG)
+             END-EXEC
            END-IF.
            EXIT.
