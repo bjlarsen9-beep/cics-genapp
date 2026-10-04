@@ -88,7 +88,73 @@ Type-specific fields are in `details`; see each policy-type section below.
 
 ## Endowment (`GET-ENDOW-DB2-INFO`, table `ENDOWMENT`)
 
-_To be filled in by the Endowment implementation._
+Request ID `01IEND`. `EndowmentPolicyInquiry` (bean for `POLICY.POLICYTYPE = 'E'`), `EndowmentDetails` (JSON
+`details`), `EndowmentPolicySeeder` (seed data), `schema-endowment.sql` (DDL).
+
+### Paragraph-to-Java mapping
+
+| COBOL paragraph / step | Java equivalent |
+|---|---|
+| `MAINLINE`: `WHEN '01IEND'` -> `INITIALIZE DB2-ENDOWMENT`, `PERFORM GET-ENDOW-DB2-INFO` | `PolicyInquiryService.inquire` dispatches to `EndowmentPolicyInquiry` (`policyType()` = `E`, `requestId()` = `01IEND`). Defaults of the INITIALIZE are applied per field in `EndowmentPolicyInquiry.details` / `PolicyCommon.fromPolicyColumns`. |
+| `GET-ENDOW-DB2-INFO`: `MOVE ' SELECT ENDOW ' TO EM-SQLREQ` | Not migrated (only used in the TDQ error message). |
+| `GET-ENDOW-DB2-INFO`: `EXEC SQL SELECT ... FROM POLICY,ENDOWMENT WHERE ...` | `EndowmentPolicyInquiry.inquire` running `SELECT_ENDOWMENT` (same 15-item column list incl. `LENGTH(PADDINGDATA)`, same implicit join and WHERE). |
+| `IF SQLCODE = 0`: `ADD WS-CA-HEADERTRAILER-LEN/WS-FULL-ENDOW-LEN/DB2-E-PADDING-LEN TO WS-REQUIRED-CA-LEN`, `IF EIBCALEN < WS-REQUIRED-CA-LEN` -> `'98'` | Not migrated: there is no caller-sized COMMAREA; the JSON body is as long as the data (see quirk 7). |
+| `IF IND-BROKERID/IND-PAYMENT NOT EQUAL MINUS-ONE` -> `MOVE DB2-*-INT TO DB2-*` | `PolicyCommon.fromPolicyColumns` (NULL gives 0 / ""). |
+| `MOVE DB2-E-TERM-SINT TO DB2-E-TERM`, `MOVE DB2-E-SUMASSURED-INT TO DB2-E-SUMASSURED` | `EndowmentPolicyInquiry.unsignedDisplay` (`abs(value) % 100` and `% 1000000`, see quirk 5). |
+| `MOVE DB2-POLICY-COMMON TO CA-POLICY-COMMON` | `Policy.common` (`PolicyCommon`). |
+| `MOVE DB2-ENDOW-FIXED TO CA-ENDOWMENT(1:WS-ENDOW-LEN)` | `EndowmentPolicyInquiry.details` builds `EndowmentDetails`. |
+| `IF IND-E-PADDINGDATA NOT EQUAL MINUS-ONE` -> `MOVE DB2-E-PADDINGDATA TO CA-E-PADDING-DATA(1:DB2-E-PADDING-LEN)` | `EndowmentDetails.paddingData` (column value as stored; NULL gives ""). |
+| `MOVE 'FINAL' TO CA-E-PADDING-DATA(END-POLICY-POS:5)` | Not migrated: COMMAREA end-of-data marker (see quirk 7). |
+| `ELSE IF SQLCODE EQUAL 100` -> `'01'` | Empty result -> `Optional.empty()` -> `PolicyInquiryService` returns `ReturnCode.NOT_FOUND` (404). |
+| `ELSE` -> `'90'`, `PERFORM WRITE-ERROR-MESSAGE` | `DataAccessException` -> `ReturnCode.DB2_ERROR` (500), logged by `PolicyInquiryService.writeErrorMessage` without PII. NULL in a column without an indicator raises SQLCODE -305 (quirk 4). |
+
+### Field mapping (`CA-ENDOWMENT` -> JSON `details`)
+
+| COBOL field (`lgcmarea.cpy`) | Db2 column | JSON property | `ksdspoly.txt` (LGAPVS01) |
+|---|---|---|---|
+| `CA-E-WITH-PROFITS PIC X` | `ENDOWMENT.withProfits CHAR(1)` | `details.withProfits` | `WF-E-WITH-PROFITS X(1)`, offset 21 |
+| `CA-E-EQUITIES PIC X` | `ENDOWMENT.equities CHAR(1)` | `details.equities` | `WF-E-EQUITIES X(1)`, offset 22 |
+| `CA-E-MANAGED-FUND PIC X` | `ENDOWMENT.managedFund CHAR(1)` | `details.managedFund` | `WF-E-MANAGED-FUND X(1)`, offset 23 |
+| `CA-E-FUND-NAME PIC X(10)` | `ENDOWMENT.fundName CHAR(10)` | `details.fundName` | `WF-E-FUND-NAME X(10)`, offset 24 |
+| `CA-E-TERM PIC 99` | `ENDOWMENT.term SMALLINT` | `details.term` (number) | not in file (from `db2cre.jcl`) |
+| `CA-E-SUM-ASSURED PIC 9(6)` | `ENDOWMENT.sumAssured INTEGER` | `details.sumAssured` (number) | not in file (from `db2cre.jcl`) |
+| `CA-E-LIFE-ASSURED PIC X(31)` | `ENDOWMENT.lifeAssured CHAR(31)` | `details.lifeAssured` | `WF-E-LIFE-ASSURED X(30)`, offset 34 |
+| `CA-E-PADDING-DATA PIC X(32348)` | `ENDOWMENT.paddingData VARCHAR(32606)` | `details.paddingData` ("" when NULL) | not in file; not in `db2cre.jcl` INSERTs (NULL) |
+
+Sample records: policy 4 (customer 8, `YYNLIONTMR   J. MORRIS`) and policy 5 (customer 3, `NNNSHEPPA    Shep`).
+`EndowmentPolicyInquiryParityTest` checks both against the file and the `db2cre.jcl` INSERTs;
+`EndowmentSchemaParityTest` checks the H2 DDL (columns, types, lengths, primary key, cascading FK to `POLICY`).
+
+### Endowment-specific quirks
+
+1. **Column order differs between the table and the COMMAREA.** The `ENDOWMENT` DDL has `equities` before
+   `withProfits`; `CA-ENDOWMENT`, the SELECT and `WF-E-Policy-Data` have `WITH-PROFITS` first. Both sample policies
+   have the same value in the two columns (`N`/`N`, `Y`/`Y`), so the sample data cannot detect a swap of these
+   fields; the Java code maps by column name and the parity tests check each property separately.
+2. **`ksdspoly.txt` truncates the life assured.** `WF-E-LIFE-ASSURED` is `X(30)` but `CA-E-LIFE-ASSURED` and the
+   column are 31 bytes, so LGAPVS01 drops the 31st character. Seeding from the file (as required) would lose it;
+   neither sample name (`J. MORRIS`, `Shep`) is long enough to be affected.
+3. **The file has no term or sum assured.** LGAPVS01 does not write `CA-E-TERM` or `CA-E-SUM-ASSURED`, so
+   `EndowmentPolicySeeder` takes `term` and `sumAssured` from the `db2cre.jcl` INSERT (policy 4: 5 / 12500; policy 5:
+   10 / 50000). For the five fields the file does hold, the file and the INSERTs agree for both sample policies
+   (checked by `summaryFieldsAgreeWithDb2CreInserts`), so no file-over-JCL override changes a value.
+4. **Only `PADDINGDATA` has a NULL indicator.** `withProfits`, `equities`, `managedFund`, `fundName`, `term`,
+   `sumAssured` and `lifeAssured` are nullable in the DDL but are fetched without an indicator variable. On Db2 a NULL
+   there fails the SELECT with SQLCODE -305, which the paragraph reports as `'90'`. `EndowmentPolicyInquiry` raises
+   the same SQLCODE (-305), so the service returns 500 / `90`. `PADDINGDATA` NULL is normal (no INSERT sets it):
+   the COBOL skips the MOVE and Java returns "".
+5. **Numeric MOVEs truncate.** `DB2-E-TERM-SINT PIC S9(4) COMP` is moved to `PIC 99` and `DB2-E-SUMASSURED-INT
+   PIC S9(9) COMP` to `PIC 9(6)`: the sign is dropped and high-order digits are lost (term 123 -> 23, sum assured
+   1234567 -> 234567, -7 -> 7). Java reproduces this for parity; a reviewer should decide whether the REST API should
+   return the real Db2 value instead. (The shared `PolicyCommon.payment`, `INTEGER` -> `CA-PAYMENT PIC 9(6)`, is not
+   truncated.)
+6. **The join does not check the policy type.** `WHERE` only joins on `POLICYNUMBER` and filters `POLICY.CUSTOMERNUMBER`;
+   a `POLICY` row of type `E` without an `ENDOWMENT` row returns SQLCODE 100 (`01`), and Java does the same.
+7. **COMMAREA framing is not migrated.** The `EIBCALEN` length check (`98`) and the `'FINAL'` marker written right
+   after the padding data (at `CA-E-PADDING-DATA(1:5)` when `PADDINGDATA` is NULL) have no REST equivalent, so
+   `paddingData` never contains `FINAL`. Note also the size mismatch: the column is `VARCHAR(32606)`, the host
+   variable `X(32611)`, but `CA-E-PADDING-DATA` only `X(32348)`; COBOL relies on the `EIBCALEN` check, Java returns
+   the full value.
 
 ## House (`GET-HOUSE-DB2-INFO`, table `HOUSE`)
 
