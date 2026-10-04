@@ -37,4 +37,11 @@ Maven Central mirror for the wrapper download and configure the same mirror in `
 - `PolicySeedDataTest`: every `ksdspoly.txt` record has a `POLICY` row with the same key and type; other columns
   match the `db2cre.jcl` INSERTs.
 - `PolicyInquiryValidationTest`: type-independent not-found and malformed-input cases.
+- `EndowmentPolicyInquiryParityTest`, `HousePolicyInquiryParityTest`, `MotorPolicyInquiryParityTest`,
+  `CommercialPolicyInquiryParityTest`: every `ksdspoly.txt` record of the type, read independently with the LGAPVS01
+  offsets, checked field by field against the REST response (plus `db2cre.jcl` for columns the file lacks), with
+  not-found, malformed-input and NULL/truncation cases.
+- `EndowmentSchemaParityTest`, `HouseSchemaParityTest`, `MotorSchemaParityTest`, `CommercialSchemaParityTest`: H2
+  type tables match `db2cre.jcl`.
+- `PolicyCommonTest`: `CA-POLICY-COMMON` moves (NULL indicators, SQLCODE -305, unsigned truncation).
 - `PolicyInquiryErrorMappingTest`: branches sample data cannot trigger (Db2 error -> 500, unknown type -> 400/`99`).

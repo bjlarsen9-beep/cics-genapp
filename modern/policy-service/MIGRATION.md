@@ -85,6 +85,15 @@ Type-specific fields are in `details`; see each policy-type section below.
    `PIC S9(9) COMP`; Java looks up the full value, so such numbers return 404.
 5. **Error logging.** `WRITE-ERROR-MESSAGE` wrote customer and policy numbers and a COMMAREA dump to a TD queue. The
    Java log line has only the exception type and SQLCODE.
+6. **Common-field moves.** In `GET-ENDOW/HOUSE/MOTOR-DB2-INFO` only BROKERID, BROKERSREFERENCE and PAYMENT have
+   NULL indicators (NULL keeps the INITIALIZEd 0 or ""). A NULL ISSUEDATE, EXPIRYDATE or LASTCHANGED is SQLCODE -305
+   (`90`). `MOVE DB2-PAYMENT-INT TO CA-PAYMENT PIC 9(6)` drops the sign and high-order digits and BROKERID loses its
+   sign. `PolicyCommon.fromPolicyColumns` does the same (`PolicyCommonTest`). Whether the REST API should keep these
+   truncations needs a reviewer decision.
+7. **Sample sources disagree on policy 7.** `ksdspoly.txt` has policy 7 (customer 6) as type `H`, and `db2cre.jcl`
+   has a HOUSE row for it, but its POLICY INSERT says `POLICYTYPE 'C'`. The file wins, so policy 7 is served as House.
+8. **Type stored in the POLICY row, not checked by the SELECTs.** None of the LGIPDB01 SELECTs filter on POLICYTYPE. A
+   POLICY row with no type row returns SQLCODE 100 (`01`), and Java does the same.
 
 ## Endowment (`GET-ENDOW-DB2-INFO`, table `ENDOWMENT`)
 
