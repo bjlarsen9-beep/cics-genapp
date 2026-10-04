@@ -158,7 +158,72 @@ Sample records: policy 4 (customer 8, `YYNLIONTMR   J. MORRIS`) and policy 5 (cu
 
 ## House (`GET-HOUSE-DB2-INFO`, table `HOUSE`)
 
-_To be filled in by the House implementation._
+Request ID `01IHOU`, policy type `H`. Java: `HousePolicyInquiry` (SELECT), `HouseDetails` (JSON `details`),
+`HousePolicySeeder` (H2 seed), `schema-house.sql` (DDL). Sample data: policies 6, 7 and 8 (customers 4, 6 and 9).
+
+### Paragraph-to-Java mapping (`GET-HOUSE-DB2-INFO`)
+
+| COBOL paragraph / step | Java equivalent |
+|---|---|
+| `MAINLINE`: `WHEN '01IHOU'` -> `INITIALIZE DB2-HOUSE`, `PERFORM GET-HOUSE-DB2-INFO` | `PolicyInquiryService.inquire` dispatches to `HousePolicyInquiry` (`policyType()` = `H`, `requestId()` = `01IHOU`); a fresh `HouseDetails` per call replaces `INITIALIZE`. |
+| `MOVE ' SELECT HOUSE ' TO EM-SQLREQ` | Not migrated (only used in the TDQ error message). |
+| `EXEC SQL SELECT ISSUEDATE ... POSTCODE FROM POLICY,HOUSE WHERE POLICY.POLICYNUMBER = HOUSE.POLICYNUMBER AND POLICY.CUSTOMERNUMBER = :DB2-CUSTOMERNUM-INT AND POLICY.POLICYNUMBER = :DB2-POLICYNUM-INT` | `HousePolicyInquiry.SELECT_HOUSE` (same 12 columns in the same order, same implicit join and `WHERE`), run by `HousePolicyInquiry.inquire`. |
+| `INTO ... :DB2-BROKERID-INT INDICATOR :IND-BROKERID`, `:DB2-BROKERSREF INDICATOR :IND-BROKERSREF`, `:DB2-PAYMENT-INT INDICATOR :IND-PAYMENT` | `PolicyCommon.fromPolicyColumns`: NULL -> 0 / `""` (the `INITIALIZE`d host-variable value). |
+| `INTO` the other nine host variables (no indicator) | `HousePolicyInquiry.toPolicy`: a NULL in any of `HousePolicyInquiry.COLUMNS_WITHOUT_INDICATOR` throws `SQLException` with SQLCODE -305 -> `90` (quirk 6). |
+| `IF SQLCODE = 0`: `ADD WS-CA-HEADERTRAILER-LEN`, `WS-FULL-HOUSE-LEN`; `IF EIBCALEN < WS-REQUIRED-CA-LEN` -> `'98'` | Not migrated: no COMMAREA length in REST; the JSON response is always complete. |
+| `IF IND-BROKERID NOT EQUAL MINUS-ONE MOVE DB2-BROKERID-INT TO DB2-BROKERID`; same for `IND-PAYMENT` | `Db2Format.number` (NULL -> 0) in `PolicyCommon.fromPolicyColumns`. |
+| `MOVE DB2-H-BEDROOMS-SINT TO DB2-H-BEDROOMS`, `MOVE DB2-H-VALUE-INT TO DB2-H-VALUE` | `HousePolicyInquiry.toPolicy`: `Math.abs(n) % 1_000` and `Math.abs(n) % 100_000_000` (unsigned `PIC 9(3)`/`9(8)` receiving fields, quirk 7). |
+| `MOVE DB2-POLICY-COMMON TO CA-POLICY-COMMON` | `PolicyCommon.fromPolicyColumns` -> `Policy.common`. |
+| `MOVE DB2-HOUSE TO CA-HOUSE(1:WS-HOUSE-LEN)` | `new HouseDetails(...)` -> `Policy.details`. |
+| `MOVE 'FINAL' TO CA-H-FILLER(1:5)` | Not migrated: end-of-data marker of the COMMAREA; JSON needs none. |
+| `ELSE IF SQLCODE EQUAL 100` -> `'01'` | Empty result -> `Optional.empty()` -> `ReturnCode.NOT_FOUND` (404). |
+| `ELSE` -> `'90'` + `PERFORM WRITE-ERROR-MESSAGE` | `DataAccessException` (including SQLCODE -305 above and -811 via `IncorrectResultSizeDataAccessException`) -> `PolicyInquiryService.writeErrorMessage` + `ReturnCode.DB2_ERROR` (500). |
+
+### Field mapping (`CA-HOUSE` -> JSON `details`)
+
+| COBOL field (`lgcmarea.cpy`) | Db2 column | JSON property |
+|---|---|---|
+| `CA-H-PROPERTY-TYPE PIC X(15)` | `HOUSE.propertyType CHAR(15)` | `details.propertyType` |
+| `CA-H-BEDROOMS PIC 9(3)` | `HOUSE.bedrooms SMALLINT` | `details.bedrooms` (number) |
+| `CA-H-VALUE PIC 9(8)` | `HOUSE.value INTEGER` | `details.value` (number) |
+| `CA-H-HOUSE-NAME PIC X(20)` | `HOUSE.houseName CHAR(20)` | `details.houseName` |
+| `CA-H-HOUSE-NUMBER PIC X(4)` | `HOUSE.houseNumber CHAR(4)` | `details.houseNumber` (leading spaces kept, e.g. `"   5"`) |
+| `CA-H-POSTCODE PIC X(8)` | `HOUSE.postcode CHAR(8)` | `details.postcode` |
+| `CA-H-FILLER PIC X(32342)` | - | Not returned (holds `FINAL`). |
+
+Seed sources (`HousePolicySeeder`): `ksdspoly.txt` `WF-H-Policy-Data` (LGAPVS01) gives `propertyType`
+(`WF-H-PROPERTY-TYPE X(15)`), `bedrooms` (`WF-H-BEDROOMS 9(3)`), `value` (`WF-H-VALUE 9(8)`), `postcode`
+(`WF-H-POSTCODE X(8)`) and `houseName` (`WF-H-HOUSE-NAME X(9)`); `houseNumber` comes from the `house` INSERT in
+`db2cre.jcl`. Parity is checked by `HousePolicyInquiryParityTest` (file read independently) and `HouseSchemaParityTest`.
+
+### House legacy quirks
+
+1. **Policy 7 type disagreement.** `ksdspoly.txt` has policy 7 (customer 6) as `H`; the `policy` INSERT in
+   `db2cre.jcl` has `POLICYTYPE 'C'`, yet there is a `house` INSERT for 7 (`FARM`, `HOME FARM`) and no `commercial`
+   INSERT. The file wins: policy 7 is a House policy.
+2. **Policy 7 bedrooms disagreement.** `WF-H-BEDROOMS` is `004`; the `house` INSERT has `bedrooms 8`. The file wins:
+   the service returns 4.
+3. **Non-numeric `PIC 9(3)` bedrooms.** Policies 6 and 8 have `WF-H-BEDROOMS` `"5 0"` and `"1 0"` (an embedded space)
+   while `WF-H-VALUE` (`01500000`, `00260000`) is valid, so the record was probably hand-edited. Invalid numeric data
+   is not used: the seeder falls back to the `db2cre.jcl` values 5 and 1 (which match the leading digit). Read as
+   zoned decimal on z/OS (space = x'40', digit nibble 0) the field would be 500 and 100.
+4. **House name truncated in the summary.** `WF-H-HOUSE-NAME` is `X(9)` but `CA-H-HOUSE-NAME`/`HOUSENAME` is 20
+   characters, and the summary field order (postcode before name) differs from the COMMAREA. `HOME FARM` fits
+   exactly; the seeder keeps a longer `db2cre.jcl` name only when it starts with the 9-character summary. Policies 6
+   and 8 have a blank name (`' '` in the INSERT).
+5. **House number only in Db2.** `CA-H-HOUSE-NUMBER` is not in the summary, so `houseNumber` comes only from
+   `db2cre.jcl`; the values are right-aligned with leading spaces (`'   5'`, `'   4'`, `' 12b'`) and returned as is.
+6. **Missing NULL indicators.** Only `BROKERID`, `BROKERSREFERENCE` and `PAYMENT` have indicator variables. A NULL in
+   `ISSUEDATE`, `EXPIRYDATE`, `LASTCHANGED` or any HOUSE column gives SQLCODE -305 and `'90'`, so all HOUSE columns
+   are effectively mandatory even though the DDL allows NULL. Java does the same. `IND-BROKERSREF` is set but never
+   tested: the NULL leaves the `INITIALIZE`d spaces, i.e. `""`.
+7. **Numeric MOVE truncation.** `SMALLINT` bedrooms goes to unsigned `PIC 9(3)` and `INTEGER` value to unsigned
+   `PIC 9(8)`: the sign is dropped and high-order digits are lost (1234 -> 234, -123456789 -> 23456789). A house
+   worth 100,000,000 or more cannot be returned correctly.
+8. **`VALUE` is reserved in H2.** The column is quoted (`"VALUE"`) in `schema-house.sql`, the SELECT and the seed
+   INSERT; its name stays `VALUE`.
+9. **Short policy term.** Policy 6 runs `2011-09-01` to `2011-12-31` (4 months) while the other sample policies run
+   one year; returned as stored.
 
 ## Motor (`GET-MOTOR-DB2-INFO`, table `MOTOR`)
 
