@@ -96,7 +96,72 @@ _To be filled in by the House implementation._
 
 ## Motor (`GET-MOTOR-DB2-INFO`, table `MOTOR`)
 
-_To be filled in by the Motor implementation._
+Implemented by `MotorPolicyInquiry` (`policyType()` = `M`, `requestId()` = `01IMOT`), `MotorDetails`,
+`MotorPolicySeeder` and `src/main/resources/schema-motor.sql`.
+
+### Paragraph-to-Java mapping (`GET-MOTOR-DB2-INFO`)
+
+| COBOL paragraph / step | Java equivalent |
+|---|---|
+| `MAINLINE`: `WHEN '01IMOT'` -> `INITIALIZE DB2-MOTOR`, `PERFORM GET-MOTOR-DB2-INFO` | `PolicyInquiryService.inquire` dispatches to `MotorPolicyInquiry.inquire` when `POLICY.POLICYTYPE` is `M`; every `MotorDetails` field is built fresh (no stale host variables). |
+| `MOVE ' SELECT MOTOR ' TO EM-SQLREQ` | Not migrated (only used in the TDQ error text). |
+| `EXEC SQL SELECT ISSUEDATE, ... ACCIDENTS FROM POLICY,MOTOR WHERE POLICY.POLICYNUMBER = MOTOR.POLICYNUMBER AND POLICY.CUSTOMERNUMBER = :DB2-CUSTOMERNUM-INT AND POLICY.POLICYNUMBER = :DB2-POLICYNUM-INT` | `MotorPolicyInquiry.SELECT_MOTOR` (same 15 columns in the same order, same implicit join and `WHERE`); run with `JdbcTemplate.query`. |
+| `INDICATOR :IND-BROKERID / :IND-BROKERSREF / :IND-PAYMENT` and `IF IND-... NOT EQUAL MINUS-ONE` | `PolicyCommon.fromPolicyColumns`: NULL gives 0 / `""` (the `INITIALIZE`d value). |
+| Host variables with no indicator (dates, `LASTCHANGED`, all MOTOR columns): NULL -> SQLCODE -305 | `MotorPolicyInquiry.requireNonNull` throws `SQLException` (SQLSTATE 22002, error code -305) -> `DataAccessException` -> `90` (quirk 3). |
+| `IF SQLCODE = 0`: `ADD WS-CA-HEADERTRAILER-LEN`, `ADD WS-FULL-MOTOR-LEN` (137), `IF EIBCALEN < WS-REQUIRED-CA-LEN` -> `'98'` | Not reachable: a REST response has no caller-sized COMMAREA. |
+| `MOVE DB2-M-CC-SINT TO DB2-M-CC`, `MOVE DB2-M-VALUE-INT TO DB2-M-VALUE` | `MotorPolicyInquiry.toUnsigned(value, 4)` / `toUnsigned(value, 6)` (quirk 4). |
+| `MOVE DB2-M-PREMIUM-INT TO DB2-M-PREMIUM / CA-M-PREMIUM`, `MOVE DB2-M-ACCIDENTS-INT TO DB2-M-ACCIDENTS / CA-M-ACCIDENTS` | `MotorDetails.premium` / `accidents` via `toUnsigned(value, 6)` (quirk 5). |
+| `MOVE DB2-POLICY-COMMON TO CA-POLICY-COMMON` | `PolicyCommon.fromPolicyColumns(rs)`. |
+| `MOVE DB2-MOTOR TO CA-MOTOR(1:WS-MOTOR-LEN)` | `new MotorDetails(...)` in `MotorPolicyInquiry.map`. |
+| `MOVE 'FINAL' TO CA-M-FILLER(1:5)` | Not migrated: end-of-data marker inside the COMMAREA; JSON is self-delimiting. |
+| `ELSE IF SQLCODE EQUAL 100` -> `'01'` | Empty result list -> `Optional.empty()` -> `ReturnCode.NOT_FOUND` (404). |
+| `ELSE` -> `'90'` + `PERFORM WRITE-ERROR-MESSAGE` | `DataAccessException` propagates -> `PolicyInquiryService.writeErrorMessage` + `ReturnCode.DB2_ERROR` (500). |
+
+### Field mapping (`CA-MOTOR` -> JSON `details`)
+
+| COBOL field (`lgcmarea.cpy`) | Db2 column | JSON property |
+|---|---|---|
+| `CA-M-MAKE PIC X(15)` | `MOTOR.make CHAR(15)` | `details.make` |
+| `CA-M-MODEL PIC X(15)` | `MOTOR.model CHAR(15)` | `details.model` |
+| `CA-M-VALUE PIC 9(6)` | `MOTOR.value INTEGER` | `details.value` (number) |
+| `CA-M-REGNUMBER PIC X(7)` | `MOTOR.regNumber CHAR(7)` | `details.regNumber` |
+| `CA-M-COLOUR PIC X(8)` | `MOTOR.colour CHAR(8)` | `details.colour` |
+| `CA-M-CC PIC 9(4)` | `MOTOR.cc SMALLINT` | `details.cc` (number) |
+| `CA-M-MANUFACTURED PIC X(10)` | `MOTOR.yearOfManufacture DATE` | `details.manufactured` (`yyyy-MM-dd`) |
+| `CA-M-PREMIUM PIC 9(6)` | `MOTOR.premium INTEGER` | `details.premium` (number) |
+| `CA-M-ACCIDENTS PIC 9(6)` | `MOTOR.accidents INTEGER` | `details.accidents` (number) |
+| `CA-M-FILLER PIC X(32323)` | (none) | not returned (`'FINAL'` marker) |
+
+Seed sources (`MotorPolicySeeder`): `make`, `model`, `value`, `regNumber` from the `ksdspoly.txt` record
+(LGAPVS01 `WF-M-MAKE X(15)`, `WF-M-MODEL X(15)`, `WF-M-VALUE 9(6)`, `WF-M-REGNUMBER X(7)` at offsets 0, 15, 30, 36 of
+`WF-Policy-Data`); `colour`, `cc`, `yearOfManufacture`, `premium`, `accidents` from the `motor` INSERT in `db2cre.jcl`.
+Checked by `MotorPolicyInquiryParityTest` (policies 1, 2, 3 for customers 2, 10, 5) and `MotorSchemaParityTest`.
+
+### Motor-specific legacy quirks
+
+1. **Policy 1 `VALUE` disagrees.** `ksdspoly.txt` has `WF-M-VALUE` = `085000` (85,000) for the FORD KA; the
+   `db2cre.jcl` INSERT has `8500`. The file wins, so the service returns `85000`. Policies 2 and 3 (`000600`, `023500`)
+   agree with the JCL, and MAKE, MODEL and REGNUMBER agree for all three. Which value is right needs a business check.
+2. **`VALUE` is a reserved word in H2.** Db2 accepts `value` as a column name; H2 rejects it unquoted. The H2 DDL
+   and the Java SQL use `"VALUE"` (same stored name `VALUE`, so the column list still matches the Db2 DDL).
+3. **NULL handling is uneven.** Only `BROKERID`, `BROKERSREFERENCE` and `PAYMENT` have indicator variables. A NULL
+   in any other selected column (`ISSUEDATE`, `EXPIRYDATE`, `LASTCHANGED` or any MOTOR column) makes Db2 return
+   SQLCODE -305, which the paragraph turns into `90`. The DDL allows NULL in every MOTOR column, so a row inserted
+   without, say, a colour cannot be read back. Java keeps this (`90`/500, logged as SQLCODE=-305); a reviewer may
+   prefer defaults. `IND-BROKERSREF` is declared but never tested: a NULL leaves the `INITIALIZE`d spaces (`""`).
+4. **Numeric MOVEs truncate silently.** `VALUE`, `PREMIUM` and `ACCIDENTS` are `INTEGER` (up to 2,147,483,647) but
+   `CA-M-VALUE`/`CA-M-PREMIUM`/`CA-M-ACCIDENTS` are `PIC 9(6)`; `CC` is `SMALLINT` into `PIC 9(4)`. COBOL keeps the
+   low-order digits and drops the sign (1,234,567 -> 234567; -1600 -> 1600). Java does the same (`toUnsigned`) for
+   parity; no sample row is affected.
+5. **`WS-MOTOR-LEN` is 65, not 77.** `MOVE DB2-MOTOR TO CA-MOTOR(1:WS-MOTOR-LEN)` copies only MAKE through
+   MANUFACTURED (15+15+6+7+8+4+10 = 65 bytes); PREMIUM and ACCIDENTS reach the COMMAREA only through the separate
+   `MOVE ... TO CA-M-PREMIUM/CA-M-ACCIDENTS`. The result is the same; Java maps all nine fields directly.
+6. **Sample file formats.** `WF-M-VALUE` is zero-padded (`000600`), and text fields are space-padded (policy 3's
+   registration `FIRE1` is followed by two spaces). The JSON strips trailing spaces and returns the number. The
+   Motor rows in `db2cre.jcl` are in policy order 1, 3, 2, and `ksdspoly.txt` is sorted by type then customer, so policy
+   numbers do not follow customer order (customer 2 -> 1, customer 5 -> 3, customer 10 -> 2).
+7. **Sample data has no broker or payment.** All three Motor `policy` INSERTs have `brokerId` 0, `brokersReference`
+   `''` and `payment` 0, so the indicator paths are only covered by the test that inserts a row with NULLs.
 
 ## Commercial (`GET-Commercial-DB2-INFO-1`, table `COMMERCIAL`)
 
